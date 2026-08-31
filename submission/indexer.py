@@ -27,6 +27,8 @@ compact postings encoding is worth more here than in most course
 assignments — see the `save()` docstring for concrete starting points.
 """
 import re
+import os
+import json
 from typing import Dict, List, Tuple
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
@@ -34,7 +36,28 @@ _TOKEN_RE = re.compile(r"[a-z0-9]+")
 
 def tokenize(text: str) -> List[str]:
     """Lowercase, alphanumeric-only tokenization."""
-    return _TOKEN_RE.findall(text.lower())
+    tokens = _TOKEN_RE.findall(text.lower())
+
+    stemmed = []
+
+    for token in tokens:
+        # plural forms
+        if len(token) > 4 and token.endswith("ies"):
+            token = token[:-3] + "y"
+        elif len(token) > 4 and token.endswith("es"):
+            token = token[:-2]
+        elif len(token) > 3 and token.endswith("s"):
+            token = token[:-1]
+
+        # common verb/adjective forms
+        if len(token) > 5 and token.endswith("ing"):
+            token = token[:-3]
+        elif len(token) > 5 and token.endswith("ed"):
+            token = token[:-2]
+
+        stemmed.append(token)
+
+    return stemmed
 
 
 class InvertedIndex:
@@ -53,19 +76,42 @@ class InvertedIndex:
 
     def build(self, corpus: List[Tuple[str, str]]) -> None:
         """corpus: list of (doc_id, text) pairs, e.g. from
-        submission.corpus_utils.load_corpus().
+        submission.corpus_utils.load_corpus()."""
 
-        TODO(you): tokenize each document, populate self.postings,
-        self.doc_len, self.doc_text, self.N, and self.avg_doc_len.
-        """
-        raise NotImplementedError("Implement InvertedIndex.build() — see assignment Section 4.1.")
+        self.postings = {}
+        self.doc_len = {}
+        self.doc_text = {}
+
+        for (doc_id, text) in corpus:
+            tokens = tokenize(text)
+
+            self.doc_len[doc_id] = len(tokens)
+            self.doc_text[doc_id] = text
+
+            for term in tokens:
+                if term not in self.postings:
+                    self.postings[term] = {}
+
+                if doc_id not in self.postings[term]:
+                    self.postings[term][doc_id] = 0
+
+                self.postings[term][doc_id] += 1
+
+        self.N = len(corpus)
+
+        if self.N > 0:
+            self.avg_doc_len = sum(self.doc_len.values()) / self.N
+        else: 
+            self.avg_doc_len = 0.0
+
 
     def document_frequency(self, term: str) -> int:
-        """Number of documents containing `term` at least once.
 
-        TODO(you): implement using self.postings.
-        """
-        raise NotImplementedError("Implement InvertedIndex.document_frequency().")
+        if term not in self.postings: 
+            return 0
+
+        return len(self.postings[term])
+
 
     def save(self, index_dir: str) -> None:
         """Persist everything document_frequency() / your scorers need to
@@ -87,7 +133,18 @@ class InvertedIndex:
 
         TODO(you): implement.
         """
-        raise NotImplementedError("Implement InvertedIndex.save() — see assignment Section 4.1.")
+
+        os.makedirs(index_dir, exist_ok=True)
+
+        index_file_data = {}
+        index_file_data["postings"] = self.postings
+        index_file_data["doc_len"] = self.doc_len
+        index_file_data["N"] = self.N
+        index_file_data["avg_doc_len"] = self.avg_doc_len
+
+        index_file_path = os.path.join(index_dir, "index.json")
+        with open(index_file_path, "w", encoding="utf-8") as file:
+            json.dump(index_file_data, file, indent=4)
 
     @classmethod
     def load(cls, index_dir: str) -> "InvertedIndex":
@@ -97,4 +154,15 @@ class InvertedIndex:
 
         TODO(you): implement, matching whatever format save() wrote.
         """
-        raise NotImplementedError("Implement InvertedIndex.load() — see assignment Section 4.1.")
+
+        index_file_path = os.path.join(index_dir, "index.json")
+        with open(index_file_path, "r", encoding="utf-8") as file:
+            json_data = json.load(file)
+
+        inverted_index = cls()
+        inverted_index.postings = json_data["postings"]
+        inverted_index.doc_len = json_data["doc_len"]
+        inverted_index.N = json_data["N"]
+        inverted_index.avg_doc_len = json_data["avg_doc_len"]
+
+        return inverted_index
