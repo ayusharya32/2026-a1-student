@@ -61,12 +61,12 @@ def score(query: str, k: int, k1: float = 1.2, b: float = 0.75) -> List[Tuple[st
         if term not in _loaded_inverted_index.postings:
             continue
 
+        idf = get_idf(term)
+
         for doc_id in _loaded_inverted_index.postings[term]:
             tf = _loaded_inverted_index.postings[term][doc_id]
             doc_len = _loaded_inverted_index.doc_len[doc_id]
             avgdl = _loaded_inverted_index.avg_doc_len
-
-            idf = get_idf(term)
 
             numerator = tf * (k1 +1)
             denominator = tf + k1 * (1 - b + b * doc_len / avgdl)

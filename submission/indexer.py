@@ -282,13 +282,10 @@ class InvertedIndex:
                 posting_list = self.postings[term]
 
                 # Integer document IDs are sorted before delta encoding.
-                entries = sorted(
-                    (
-                        doc_to_int[doc_id],
-                        tf,
-                    )
+                entries = [
+                    (doc_to_int[doc_id], tf)
                     for doc_id, tf in posting_list.items()
-                )
+                ]
 
                 buffer = bytearray()
 
