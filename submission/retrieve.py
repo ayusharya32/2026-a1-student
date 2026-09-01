@@ -64,7 +64,7 @@ _DOC_ORDER: Optional[List[str]] = None  # [doc_id, ...] in the order build_index
 
 _DOC_ORDER_FILENAME = "doc_order.json"  # TODO(you): replace with your real index files
 
-BM25_K1 = float(os.getenv("BM25_K1", "2.0"))
+BM25_K1 = float(os.getenv("BM25_K1", "2.45"))
 BM25_B = float(os.getenv("BM25_B", "0.6"))
 
 def build_index(corpus_path: str, index_dir: str) -> None:
