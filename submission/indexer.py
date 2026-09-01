@@ -139,6 +139,13 @@ def write_var_int(file, value: int) -> None:
 
     file.write(bytes([value]))
 
+def encode_var_int(buffer: bytearray, value: int) -> None:
+    """Append a non-negative integer using variable-byte encoding."""
+    while value >= 128:
+        buffer.append((value & 127) | 128)
+        value >>= 7
+
+    buffer.append(value)
 
 def read_var_int(file) -> int:
     """Read one variable-byte encoded non-negative integer."""
@@ -283,15 +290,21 @@ class InvertedIndex:
                     for doc_id, tf in posting_list.items()
                 )
 
-                write_var_int(postings_file, len(entries))
+                buffer = bytearray()
+
+                encode_var_int(buffer, len(entries))
 
                 previous_doc = 0
 
                 for doc_int, tf in entries:
                     gap = doc_int - previous_doc
-                    write_var_int(postings_file, gap)
-                    write_var_int(postings_file, tf)
+
+                    encode_var_int(buffer, gap)
+                    encode_var_int(buffer, tf)
+
                     previous_doc = doc_int
+
+                postings_file.write(buffer)
 
                 end = postings_file.tell()
 
