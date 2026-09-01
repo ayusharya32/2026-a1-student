@@ -1,199 +1,17 @@
-"""
-submission/indexer.py — build your inverted index here.
-
-This is one of the required components (assignment Section 4.1): you must
-build the inverted index yourself, without an existing search/indexing
-library (Lucene, Elasticsearch, Pyserini, Whoosh, etc.).
-
-A `tokenize()` helper is provided below purely so that tokenization is
-consistent across your Boolean/VSM and BM25 scorers —
-feel free to replace it (e.g. add stemming or stopword removal), just make
-sure every scorer that reads this index was built with the same tokenizer.
-
-Everything else — the postings representation, what per-document and
-collection statistics you track, whether you add positions for
-proximity/phrase features — is your design decision. `InvertedIndex`
-below sketches a minimal, obviously-sufficient shape; you do not have to
-use it, but if you do, filling in `build()` and `document_frequency()` is
-enough to support Boolean/VSM and BM25.
-
-Persistence (assignment Section 4.1 / Section 7 "index size" scoring):
-`build_index()` in retrieve.py runs in one process and `load_index()` runs
-in a separate, later one — so whatever this index needs at query time must
-round-trip through `save()`/`load()` below, not just live as Python
-attributes. The on-disk byte size of what `save()` writes is graded
-directly (smaller, relative to the class median, scores better), so a
-compact postings encoding is worth more here than in most course
-assignments — see the `save()` docstring for concrete starting points.
-"""
-import re
 import os
-import json
 import struct
 from typing import Dict, List, Tuple
+import json
+from collections import Counter
 
-_TOKEN_RE = re.compile(
-    r"""
-    [a-z]+(?:'[a-z]+)?          # words / contractions
-    |
-    [a-z]+\d+|\d+[a-z]+         # alphanumeric terms: il6, 10mg
-    |
-    \d+(?:\.\d+)?               # numbers / decimals
-    """,
-    re.IGNORECASE | re.VERBOSE
-)
-
-STOPWORDS = {
-    "i", "me", "my", "myself", "we", "our", "ours", "ourselves",
-    "you", "your", "yours", "yourself", "yourselves",
-    "he", "him", "his", "himself", "she", "her", "hers",
-    "herself", "it", "its", "itself", "they", "them", "their",
-    "theirs", "themselves", "what", "which", "who", "whom",
-    "this", "that", "these", "those", "am", "is", "are", "was",
-    "were", "be", "been", "being", "have", "has", "had",
-    "having", "do", "does", "did", "doing", "a", "an", "the",
-    "and", "but", "if", "or", "because", "as", "until", "while",
-    "of", "at", "by", "for", "with", "about", "against", "between",
-    "into", "through", "during", "before", "after", "above",
-    "below", "to", "from", "up", "down", "in", "out", "on", "off",
-    "over", "under", "again", "further", "then", "once", "here",
-    "there", "when", "where", "why", "how", "all", "any", "both",
-    "each", "few", "more", "most", "other", "some", "such", "no",
-    "nor", "not", "only", "own", "same", "so", "than", "too",
-    "very", "s", "t", "can", "will", "just", "don", "should",
-    "now", "d", "ll", "m", "o", "re", "ve", "y", "ain", "aren",
-    "couldn", "didn", "doesn", "hadn", "hasn", "haven", "isn",
-    "ma", "mightn", "mustn", "needn", "shan", "shouldn", "wasn",
-    "weren", "won", "wouldn"
-}
-
-def stem_word(token: str) -> str:
-    # Don't stem very short words.
-    if len(token) <= 3:
-        return token
-
-    # ---------------- Plurals ----------------
-
-    # studies -> study
-    if len(token) > 4 and token.endswith("ies"):
-        return token[:-3] + "y"
-
-    # Avoid destroying words such as "virus", "analysis", "status".
-    if token.endswith(("us", "ss", "is")):
-        return token
-
-    # cases -> case
-    # causes -> cause
-    # diseases -> disease
-    if len(token) > 4 and token.endswith("es"):
-        if token.endswith(("ses", "zes", "xes", "ches", "shes")):
-            return token[:-2]
-        return token[:-1]
-
-    # patients -> patient
-    if len(token) > 3 and token.endswith("s"):
-        return token[:-1]
-
-    # ---------------- -ing forms ----------------
-
-    if len(token) > 5 and token.endswith("ing"):
-        base = token[:-3]
-
-        # triaging -> triage
-        # changing -> change
-        # dosing -> dose
-        if base.endswith(("ag", "ang", "os", "iz")):
-            return base + "e"
-
-        # running -> run
-        # stopping -> stop
-        if len(base) > 3 and base[-1] == base[-2]:
-            base = base[:-1]
-
-        return base
-
-    # ---------------- -ed forms ----------------
-
-    if len(token) > 4 and token.endswith("ed"):
-        base = token[:-2]
-
-        # changed -> change
-        # related -> relate
-        # infected -> infect
-        if base.endswith(("at", "it", "ic", "iv", "iz")):
-            return base + "e"
-
-        # stopped -> stop
-        if len(base) > 3 and base[-1] == base[-2]:
-            base = base[:-1]
-
-        return base
-
-    return token
+from submission.utils.encoding import *
+from submission.utils.tokenizer import tokenize_string
+from submission.utils.lazy_postings_map import LazyPostingsMap
 
 def tokenize(text: str) -> List[str]:
-    tokens = _TOKEN_RE.findall(text.lower())
-
-    normalized = []
-
-    for token in tokens:
-        if token in STOPWORDS:
-            continue
-
-        if "'" in token:
-            normalized.append(token)
-            continue
-
-        if token[0].isdigit():
-            normalized.append(token)
-            continue
-
-        normalized.append(stem_word(token))
-
-    return normalized
-
-def write_var_int(file, value: int) -> None:
-    """Write a non-negative integer using variable-byte encoding."""
-    while value >= 128:
-        file.write(bytes([(value & 127) | 128]))
-        value >>= 7
-
-    file.write(bytes([value]))
-
-def encode_var_int(buffer: bytearray, value: int) -> None:
-    """Append a non-negative integer using variable-byte encoding."""
-    while value >= 128:
-        buffer.append((value & 127) | 128)
-        value >>= 7
-
-    buffer.append(value)
-
-def read_var_int(file) -> int:
-    """Read one variable-byte encoded non-negative integer."""
-    value = 0
-    shift = 0
-
-    while True:
-        byte = file.read(1)
-
-        if not byte:
-            raise EOFError("Unexpected end of index file")
-
-        byte = byte[0]
-        value |= (byte & 127) << shift
-
-        if not (byte & 128):
-            return value
-
-        shift += 7
+    return tokenize_string(text)
 
 class InvertedIndex:
-    """A minimal inverted index skeleton. Extend the data structures here
-    however your design needs (e.g. term positions for phrase/proximity
-    scoring, a more compact postings representation for the efficiency
-    bonus) — this is a starting point, not a fixed schema.
-    """
-
     def __init__(self):
         self.postings: Dict[str, Dict[str, int]] = {}  # term -> {doc_id: term_freq}
         self.doc_len: Dict[str, int] = {}  # doc_id -> number of tokens
@@ -201,164 +19,169 @@ class InvertedIndex:
         self.N: int = 0  # number of documents
         self.avg_doc_len: float = 0.0
 
-    def build(self, corpus: List[Tuple[str, str]]) -> None:
-        """corpus: list of (doc_id, text) pairs, e.g. from
-        submission.corpus_utils.load_corpus()."""
+        self.vocabulary: Dict[str, Tuple[int, int, int]] = {} # term -> (offset, length, df)
 
+        self.int_to_doc: List[str] = []
+        self.postings_file = None
+        self._postings_cache: Dict[str, Dict[str, int]] = {}
+
+    def build(self, corpus: List[Tuple[str, str]]) -> None:
+        """Build index from JSONL filepath (streaming) or list of (doc_id, text) pairs."""
         self.postings = {}
         self.doc_len = {}
-        self.doc_text = {}
+        if isinstance(corpus, str):
+            with open(corpus, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    obj = json.loads(line)
+                    doc_id = obj["doc_id"]
+                    tokens = tokenize(obj["text"])
+                    self.doc_len[doc_id] = len(tokens)
 
-        for (doc_id, text) in corpus:
-            tokens = tokenize(text)
+                    counts = Counter(tokens)
+                    for term, tf in counts.items():
+                        if term not in self.postings:
+                            self.postings[term] = {}
+                        self.postings[term][doc_id] = tf
+        else:
+            for doc_id, text in corpus:
+                tokens = tokenize(text)
+                self.doc_len[doc_id] = len(tokens)
+                counts = Counter(tokens)
+                for term, tf in counts.items():
+                    if term not in self.postings:
+                        self.postings[term] = {}
+                    self.postings[term][doc_id] = tf
 
-            self.doc_len[doc_id] = len(tokens)
-            self.doc_text[doc_id] = text
-
-            for term in tokens:
-                if term not in self.postings:
-                    self.postings[term] = {}
-
-                if doc_id not in self.postings[term]:
-                    self.postings[term][doc_id] = 0
-
-                self.postings[term][doc_id] += 1
-
-        self.N = len(corpus)
-
-        if self.N > 0:
-            self.avg_doc_len = sum(self.doc_len.values()) / self.N
-        else: 
-            self.avg_doc_len = 0.0
-
+        self.N = len(self.doc_len)
+        self.avg_doc_len = (
+            sum(self.doc_len.values()) / self.N if self.N > 0 else 0.0
+        )
 
     def document_frequency(self, term: str) -> int:
+        if term in self.vocabulary:
+            return self.vocabulary[term][2]
+        if term in self.postings:
+            return len(self.postings[term])
+        return 0
 
-        if term not in self.postings: 
-            return 0
+    def get_postings(self, term: str) -> Dict[str, int]:
+        """Fetch and decode postings for a single term on demand."""
+        if term in self._postings_cache:
+            return self._postings_cache[term]
+        if term not in self.vocabulary or self.postings_file is None:
+            return {}
 
-        return len(self.postings[term])
+        offset, length, _df = self.vocabulary[term]
+        
+        self.postings_file.seek(offset)
+        raw_bytes = self.postings_file.read(length)
 
+        postings = {}
+        pos = 0
+        buf_len = len(raw_bytes)
+
+        # Read posting_count
+        val = 0
+        shift = 0
+        while pos < buf_len:
+            b = raw_bytes[pos]
+            pos += 1
+            val |= (b & 127) << shift
+            if not (b & 128):
+                break
+            shift += 7
+        count = val
+
+        current_doc = 0
+        for _ in range(count):
+            # gap
+            val = 0
+            shift = 0
+            while pos < buf_len:
+                b = raw_bytes[pos]
+                pos += 1
+                val |= (b & 127) << shift
+                if not (b & 128):
+                    break
+                shift += 7
+            gap = val
+
+            # tf
+            val = 0
+            shift = 0
+            while pos < buf_len:
+                b = raw_bytes[pos]
+                pos += 1
+                val |= (b & 127) << shift
+                if not (b & 128):
+                    break
+                shift += 7
+            tf = val
+
+            current_doc += gap
+            doc_id = self.int_to_doc[current_doc]
+            postings[doc_id] = tf
+
+        self._postings_cache[term] = postings
+        return postings
 
     def save(self, index_dir: str) -> None:
         os.makedirs(index_dir, exist_ok=True)
-
-        # Give every original document ID a compact integer ID.
         doc_ids = list(self.doc_len.keys())
         doc_to_int = {doc_id: i for i, doc_id in enumerate(doc_ids)}
 
-        # ---------------------------------------------------------------
-        # documents.bin
-        #
-        # Format:
-        #   number of documents
-        #   for each document:
-        #       ID length
-        #       ID bytes
-        #       document length
-        # ---------------------------------------------------------------
-        
-        with open(
-            os.path.join(index_dir, "documents.bin"), "wb"
-        ) as file:
+        # documents.bin (Fast buffered write)
+        doc_buf = bytearray()
+        encode_var_int(doc_buf, self.N)
+        for doc_id in doc_ids:
+            encoded_id = doc_id.encode("utf-8")
+            encode_var_int(doc_buf, len(encoded_id))
+            doc_buf.extend(encoded_id)
+            encode_var_int(doc_buf, self.doc_len[doc_id])
 
-            write_var_int(file, self.N)
+        with open(os.path.join(index_dir, "documents.bin"), "wb") as file:
+            file.write(doc_buf)
 
-            for doc_id in doc_ids:
-                encoded_id = doc_id.encode("utf-8")
-
-                write_var_int(file, len(encoded_id))
-                file.write(encoded_id)
-
-                write_var_int(file, self.doc_len[doc_id])
-
-        # ---------------------------------------------------------------
         # postings.bin + vocabulary.bin
-        #
-        # postings.bin stores:
-        #
-        #   posting_count
-        #   delta_doc_id
-        #   term_frequency
-        #
-        # for every term.
-        #
-        # vocabulary.bin stores:
-        #
-        #   term
-        #   byte offset
-        #   byte length
-        #
-        # ---------------------------------------------------------------
-
         vocabulary = []
-
-        with open(
-            os.path.join(index_dir, "postings.bin"), "wb"
-        ) as postings_file:
-
+        with open(os.path.join(index_dir, "postings.bin"), "wb") as postings_file:
             for term in sorted(self.postings):
-
                 start = postings_file.tell()
-
                 posting_list = self.postings[term]
-
-                # Integer document IDs are sorted before delta encoding.
                 entries = [
-                    (doc_to_int[doc_id], tf)
-                    for doc_id, tf in posting_list.items()
+                    (doc_to_int[doc_id], tf) for doc_id, tf in posting_list.items()
                 ]
-
                 buffer = bytearray()
-
                 encode_var_int(buffer, len(entries))
-
                 previous_doc = 0
-
                 for doc_int, tf in entries:
                     gap = doc_int - previous_doc
-
                     encode_var_int(buffer, gap)
                     encode_var_int(buffer, tf)
-
                     previous_doc = doc_int
 
                 postings_file.write(buffer)
-
                 end = postings_file.tell()
+                vocabulary.append((term, start, end - start, len(entries)))
 
-                vocabulary.append(
-                    (term, start, end - start)
-                )
+        # vocabulary.bin (Fast buffered write)
+        vocab_buf = bytearray()
+        encode_var_int(vocab_buf, len(vocabulary))
+        for term, offset, length, df in vocabulary:
+            encoded_term = term.encode("utf-8")
+            encode_var_int(vocab_buf, len(encoded_term))
+            vocab_buf.extend(encoded_term)
+            encode_var_int(vocab_buf, offset)
+            encode_var_int(vocab_buf, length)
+            encode_var_int(vocab_buf, df)
+        with open(os.path.join(index_dir, "vocabulary.bin"), "wb") as file:
+            file.write(vocab_buf)
 
-        # Vocabulary is small enough to keep as a compact binary table.
-        #
-        # Each entry:
-        #   term length
-        #   term bytes
-        #   postings offset
-        #   postings length
-        #
-        with open(
-            os.path.join(index_dir, "vocabulary.bin"), "wb"
-        ) as file:
-
-            write_var_int(file, len(vocabulary))
-
-            for term, offset, length in vocabulary:
-                encoded_term = term.encode("utf-8")
-
-                write_var_int(file, len(encoded_term))
-                file.write(encoded_term)
-
-                write_var_int(file, offset)
-                write_var_int(file, length)
-
-        # Small metadata file.
-        with open(
-            os.path.join(index_dir, "meta.bin"), "wb"
-        ) as file:
-
+        # meta.bin
+        with open(os.path.join(index_dir, "meta.bin"), "wb") as file:
             file.write(struct.pack("<Id", self.N, self.avg_doc_len))
 
     @classmethod
@@ -367,14 +190,8 @@ class InvertedIndex:
         inverted_index = cls()
 
         # ---------------------------------------------------------------
-        # Load documents and reconstruct:
-        #
-        # integer doc ID -> original doc ID
-        # original doc ID -> document length
+        # Load documents
         # ---------------------------------------------------------------
-
-        int_to_doc = []
-
         with open(
             os.path.join(index_dir, "documents.bin"), "rb"
         ) as file:
@@ -388,13 +205,12 @@ class InvertedIndex:
 
                 doc_len = read_var_int(file)
 
-                int_to_doc.append(doc_id)
+                inverted_index.int_to_doc.append(doc_id)
                 inverted_index.doc_len[doc_id] = doc_len
 
         # ---------------------------------------------------------------
-        # Load metadata.
+        # Load metadata
         # ---------------------------------------------------------------
-
         with open(
             os.path.join(index_dir, "meta.bin"), "rb"
         ) as file:
@@ -405,11 +221,8 @@ class InvertedIndex:
             )
 
         # ---------------------------------------------------------------
-        # Read vocabulary.
+        # Read vocabulary
         # ---------------------------------------------------------------
-
-        vocabulary = {}
-
         with open(
             os.path.join(index_dir, "vocabulary.bin"), "rb"
         ) as file:
@@ -423,40 +236,17 @@ class InvertedIndex:
 
                 offset = read_var_int(file)
                 length = read_var_int(file)
+                df = read_var_int(file)
 
-                vocabulary[term] = (offset, length)
+                inverted_index.vocabulary[term] = (offset, length, df)
 
-        # ---------------------------------------------------------------
-        # Reconstruct the same postings structure BM25 already expects:
-        #
-        # term -> {original_doc_id: tf}
-        # ---------------------------------------------------------------
-
-        with open(
-            os.path.join(index_dir, "postings.bin"), "rb"
-        ) as file:
-
-            for term, (offset, length) in vocabulary.items():
-
-                file.seek(offset)
-
-                posting_count = read_var_int(file)
-
-                postings = {}
-
-                current_doc = 0
-
-                for _ in range(posting_count):
-
-                    gap = read_var_int(file)
-                    tf = read_var_int(file)
-
-                    current_doc += gap
-
-                    doc_id = int_to_doc[current_doc]
-
-                    postings[doc_id] = tf
-
-                inverted_index.postings[term] = postings
+        # Attach lazy postings map and open file handle for fast on-demand seeks
+        postings_path = os.path.join(index_dir, "postings.bin")
+        if os.path.exists(postings_path):
+            inverted_index.postings_file = open(postings_path, "rb")
+        inverted_index.postings = LazyPostingsMap(inverted_index)
 
         return inverted_index
+
+
+    

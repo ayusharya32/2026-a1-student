@@ -79,7 +79,6 @@ def build_index(corpus_path: str, index_dir: str) -> None:
     is concerned.
     """
     corpus = load_corpus(corpus_path)
-
     index = InvertedIndex()
     index.build(corpus)
     index.save(index_dir)
