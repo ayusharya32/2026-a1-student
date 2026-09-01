@@ -29,36 +29,135 @@ assignments — see the `save()` docstring for concrete starting points.
 import re
 import os
 import json
+import struct
 from typing import Dict, List, Tuple
+from nltk.corpus import stopwords
 
-_TOKEN_RE = re.compile(r"[a-z0-9]+")
+_TOKEN_RE = re.compile(
+    r"""
+    [a-z]+(?:'[a-z]+)?          # words / contractions
+    |
+    [a-z]+\d+|\d+[a-z]+         # alphanumeric terms: il6, 10mg
+    |
+    \d+(?:\.\d+)?               # numbers / decimals
+    """,
+    re.IGNORECASE | re.VERBOSE
+)
 
+STOPWORDS = set(stopwords.words("english"))
+
+def stem_word(token: str) -> str:
+    # Don't stem very short words.
+    if len(token) <= 3:
+        return token
+
+    # ---------------- Plurals ----------------
+
+    # studies -> study
+    if len(token) > 4 and token.endswith("ies"):
+        return token[:-3] + "y"
+
+    # Avoid destroying words such as "virus", "analysis", "status".
+    if token.endswith(("us", "ss", "is")):
+        return token
+
+    # cases -> case
+    # causes -> cause
+    # diseases -> disease
+    if len(token) > 4 and token.endswith("es"):
+        if token.endswith(("ses", "zes", "xes", "ches", "shes")):
+            return token[:-2]
+        return token[:-1]
+
+    # patients -> patient
+    if len(token) > 3 and token.endswith("s"):
+        return token[:-1]
+
+    # ---------------- -ing forms ----------------
+
+    if len(token) > 5 and token.endswith("ing"):
+        base = token[:-3]
+
+        # triaging -> triage
+        # changing -> change
+        # dosing -> dose
+        if base.endswith(("ag", "ang", "os", "iz")):
+            return base + "e"
+
+        # running -> run
+        # stopping -> stop
+        if len(base) > 3 and base[-1] == base[-2]:
+            base = base[:-1]
+
+        return base
+
+    # ---------------- -ed forms ----------------
+
+    if len(token) > 4 and token.endswith("ed"):
+        base = token[:-2]
+
+        # changed -> change
+        # related -> relate
+        # infected -> infect
+        if base.endswith(("at", "it", "ic", "iv", "iz")):
+            return base + "e"
+
+        # stopped -> stop
+        if len(base) > 3 and base[-1] == base[-2]:
+            base = base[:-1]
+
+        return base
+
+    return token
 
 def tokenize(text: str) -> List[str]:
-    """Lowercase, alphanumeric-only tokenization."""
     tokens = _TOKEN_RE.findall(text.lower())
 
-    stemmed = []
+    normalized = []
 
     for token in tokens:
-        # plural forms
-        if len(token) > 4 and token.endswith("ies"):
-            token = token[:-3] + "y"
-        elif len(token) > 4 and token.endswith("es"):
-            token = token[:-2]
-        elif len(token) > 3 and token.endswith("s"):
-            token = token[:-1]
+        if token in STOPWORDS:
+            continue
 
-        # common verb/adjective forms
-        if len(token) > 5 and token.endswith("ing"):
-            token = token[:-3]
-        elif len(token) > 5 and token.endswith("ed"):
-            token = token[:-2]
+        if "'" in token:
+            normalized.append(token)
+            continue
 
-        stemmed.append(token)
+        if token[0].isdigit():
+            normalized.append(token)
+            continue
 
-    return stemmed
+        normalized.append(stem_word(token))
 
+    return normalized
+
+def write_var_int(file, value: int) -> None:
+    """Write a non-negative integer using variable-byte encoding."""
+    while value >= 128:
+        file.write(bytes([(value & 127) | 128]))
+        value >>= 7
+
+    file.write(bytes([value]))
+
+
+def read_var_int(file) -> int:
+    """Read one variable-byte encoded non-negative integer."""
+    value = 0
+    shift = 0
+
+    while True:
+        byte = file.read(1)
+
+        if not byte:
+            raise EOFError("Unexpected end of index file")
+
+        byte = byte[0]
+        value |= (byte & 127) << shift
+
+        if not (byte & 128):
+            return value
+
+        shift += 7
 
 class InvertedIndex:
     """A minimal inverted index skeleton. Extend the data structures here
@@ -114,55 +213,218 @@ class InvertedIndex:
 
 
     def save(self, index_dir: str) -> None:
-        """Persist everything document_frequency() / your scorers need to
-        `index_dir`, so `load()` can reconstruct this object in a fresh
-        process with no memory of `build()` ever having run. Called from
-        retrieve.build_index().
-
-        The on-disk byte size of whatever you write here is graded
-        directly (assignment Section 7, "index size", relative to the
-        class median) — some starting points, roughly in order of effort:
-          - json/pickle-dump self.postings etc. directly (works, but
-            verbose: repeats every doc_id string per posting).
-          - drop self.doc_text if your scorers don't need raw text at
-            query time (BM25/VSM only need term-frequency and length
-            statistics, not the original documents).
-          - delta-encode each postings list's doc-ids (sorted ascending,
-            store gaps instead of absolute ids) and varint/byte-pack them,
-            instead of a naive JSON list of integers.
-
-        TODO(you): implement.
-        """
-
         os.makedirs(index_dir, exist_ok=True)
 
-        index_file_data = {}
-        index_file_data["postings"] = self.postings
-        index_file_data["doc_len"] = self.doc_len
-        index_file_data["N"] = self.N
-        index_file_data["avg_doc_len"] = self.avg_doc_len
+        # Give every original document ID a compact integer ID.
+        doc_ids = list(self.doc_len.keys())
+        doc_to_int = {doc_id: i for i, doc_id in enumerate(doc_ids)}
 
-        index_file_path = os.path.join(index_dir, "index.json")
-        with open(index_file_path, "w", encoding="utf-8") as file:
-            json.dump(index_file_data, file, indent=4)
+        # ---------------------------------------------------------------
+        # documents.bin
+        #
+        # Format:
+        #   number of documents
+        #   for each document:
+        #       ID length
+        #       ID bytes
+        #       document length
+        # ---------------------------------------------------------------
+        with open(
+            os.path.join(index_dir, "documents.bin"), "wb"
+        ) as file:
+
+            write_var_int(file, self.N)
+
+            for doc_id in doc_ids:
+                encoded_id = doc_id.encode("utf-8")
+
+                write_var_int(file, len(encoded_id))
+                file.write(encoded_id)
+
+                write_var_int(file, self.doc_len[doc_id])
+
+        # ---------------------------------------------------------------
+        # postings.bin + vocabulary.bin
+        #
+        # postings.bin stores:
+        #
+        #   posting_count
+        #   delta_doc_id
+        #   term_frequency
+        #
+        # for every term.
+        #
+        # vocabulary.bin stores:
+        #
+        #   term
+        #   byte offset
+        #   byte length
+        #
+        # ---------------------------------------------------------------
+
+        vocabulary = []
+
+        with open(
+            os.path.join(index_dir, "postings.bin"), "wb"
+        ) as postings_file:
+
+            for term in sorted(self.postings):
+
+                start = postings_file.tell()
+
+                posting_list = self.postings[term]
+
+                # Integer document IDs are sorted before delta encoding.
+                entries = sorted(
+                    (
+                        doc_to_int[doc_id],
+                        tf,
+                    )
+                    for doc_id, tf in posting_list.items()
+                )
+
+                write_var_int(postings_file, len(entries))
+
+                previous_doc = 0
+
+                for doc_int, tf in entries:
+                    gap = doc_int - previous_doc
+                    write_var_int(postings_file, gap)
+                    write_var_int(postings_file, tf)
+                    previous_doc = doc_int
+
+                end = postings_file.tell()
+
+                vocabulary.append(
+                    (term, start, end - start)
+                )
+
+        # Vocabulary is small enough to keep as a compact binary table.
+        #
+        # Each entry:
+        #   term length
+        #   term bytes
+        #   postings offset
+        #   postings length
+        #
+        with open(
+            os.path.join(index_dir, "vocabulary.bin"), "wb"
+        ) as file:
+
+            write_var_int(file, len(vocabulary))
+
+            for term, offset, length in vocabulary:
+                encoded_term = term.encode("utf-8")
+
+                write_var_int(file, len(encoded_term))
+                file.write(encoded_term)
+
+                write_var_int(file, offset)
+                write_var_int(file, length)
+
+        # Small metadata file.
+        with open(
+            os.path.join(index_dir, "meta.bin"), "wb"
+        ) as file:
+
+            file.write(struct.pack("<Id", self.N, self.avg_doc_len))
 
     @classmethod
     def load(cls, index_dir: str) -> "InvertedIndex":
-        """Reconstruct an InvertedIndex purely from what save() wrote to
-        `index_dir`. Called in a fresh process — do not rely on any state
-        other than what's actually on disk in `index_dir`.
-
-        TODO(you): implement, matching whatever format save() wrote.
-        """
-
-        index_file_path = os.path.join(index_dir, "index.json")
-        with open(index_file_path, "r", encoding="utf-8") as file:
-            json_data = json.load(file)
 
         inverted_index = cls()
-        inverted_index.postings = json_data["postings"]
-        inverted_index.doc_len = json_data["doc_len"]
-        inverted_index.N = json_data["N"]
-        inverted_index.avg_doc_len = json_data["avg_doc_len"]
+
+        # ---------------------------------------------------------------
+        # Load documents and reconstruct:
+        #
+        # integer doc ID -> original doc ID
+        # original doc ID -> document length
+        # ---------------------------------------------------------------
+
+        int_to_doc = []
+
+        with open(
+            os.path.join(index_dir, "documents.bin"), "rb"
+        ) as file:
+
+            number_of_documents = read_var_int(file)
+
+            for _ in range(number_of_documents):
+
+                id_length = read_var_int(file)
+                doc_id = file.read(id_length).decode("utf-8")
+
+                doc_len = read_var_int(file)
+
+                int_to_doc.append(doc_id)
+                inverted_index.doc_len[doc_id] = doc_len
+
+        # ---------------------------------------------------------------
+        # Load metadata.
+        # ---------------------------------------------------------------
+
+        with open(
+            os.path.join(index_dir, "meta.bin"), "rb"
+        ) as file:
+
+            inverted_index.N, inverted_index.avg_doc_len = struct.unpack(
+                "<Id",
+                file.read(12),
+            )
+
+        # ---------------------------------------------------------------
+        # Read vocabulary.
+        # ---------------------------------------------------------------
+
+        vocabulary = {}
+
+        with open(
+            os.path.join(index_dir, "vocabulary.bin"), "rb"
+        ) as file:
+
+            number_of_terms = read_var_int(file)
+
+            for _ in range(number_of_terms):
+
+                term_length = read_var_int(file)
+                term = file.read(term_length).decode("utf-8")
+
+                offset = read_var_int(file)
+                length = read_var_int(file)
+
+                vocabulary[term] = (offset, length)
+
+        # ---------------------------------------------------------------
+        # Reconstruct the same postings structure BM25 already expects:
+        #
+        # term -> {original_doc_id: tf}
+        # ---------------------------------------------------------------
+
+        with open(
+            os.path.join(index_dir, "postings.bin"), "rb"
+        ) as file:
+
+            for term, (offset, length) in vocabulary.items():
+
+                file.seek(offset)
+
+                posting_count = read_var_int(file)
+
+                postings = {}
+
+                current_doc = 0
+
+                for _ in range(posting_count):
+
+                    gap = read_var_int(file)
+                    tf = read_var_int(file)
+
+                    current_doc += gap
+
+                    doc_id = int_to_doc[current_doc]
+
+                    postings[doc_id] = tf
+
+                inverted_index.postings[term] = postings
 
         return inverted_index

@@ -64,16 +64,8 @@ _DOC_ORDER: Optional[List[str]] = None  # [doc_id, ...] in the order build_index
 
 _DOC_ORDER_FILENAME = "doc_order.json"  # TODO(you): replace with your real index files
 
-BM25_K1 = float(os.getenv("BM25_K1", "2.25"))
-BM25_B = float(os.getenv("BM25_B", "0.4"))
-
-STOPWORDS = {
-    "a", "an", "and", "are", "as", "at", "be", "by",
-    "for", "from", "has", "how", "in", "is", "it",
-    "of", "on", "or", "that", "the", "this", "to",
-    "was", "what", "when", "where", "which", "who",
-    "will", "with"
-}
+BM25_K1 = float(os.getenv("BM25_K1", "2.0"))
+BM25_B = float(os.getenv("BM25_B", "0.6"))
 
 def build_index(corpus_path: str, index_dir: str) -> None:
     """Load the corpus, build whatever index structures you need, and
@@ -106,16 +98,7 @@ def load_index(index_dir: str) -> None:
 
 def retrieve(query: str, k: int = 10) -> List[Tuple[str, float]]:
     """Return up to k (doc_id, score) pairs for `query`, best first."""
-    query_terms = tokenize(query)
-
-    filtered_terms = [
-        term for term in query_terms
-        if term not in STOPWORDS
-    ]
-
-    filtered_query = " ".join(filtered_terms)
-
-    return bm25.score(filtered_query, k, k1=BM25_K1, b=BM25_B)
+    return bm25.score(query, k, k1=BM25_K1, b=BM25_B)
     # return boolean_vsm.vsm_score(query, k)
 
 
