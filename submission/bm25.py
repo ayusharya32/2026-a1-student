@@ -1,43 +1,94 @@
 from math import log
-from typing import List, Tuple
+from typing import List, Tuple, Dict
 import heapq
+from operator import itemgetter
+
 from submission.indexer import InvertedIndex, tokenize
 
+
 _loaded_inverted_index = None
+_idf_cache: Dict[str, float] = {}
+_doc_norm: List[float] = []
+
 
 def build(index: InvertedIndex) -> None:
     global _loaded_inverted_index
+    global _idf_cache
+    global _doc_norm
+
     _loaded_inverted_index = index
 
+    # Precompute IDF once during index loading.
+    _idf_cache = {}
 
-def score(query: str, k: int, k1: float = 1.2, b: float = 0.75) -> List[Tuple[str, float]]:
+    for term in index.vocabulary:
+        df = index.document_frequency(term)
+
+        _idf_cache[term] = log(
+            (index.N - df + 0.5) / (df + 0.5) + 1
+        )
+
+    # Precompute the document-length normalization part
+    # of the BM25 denominator.
+    avgdl = index.avg_doc_len
+    b = 0.6
+
+    _doc_norm = [
+        1 - b + b * doc_len / avgdl
+        for doc_len in index.doc_len_by_int
+    ]
+
+
+def get_index() -> InvertedIndex:
+    return _loaded_inverted_index
+
+
+def score(
+    query: str,
+    k: int,
+    k1: float = 1.2,
+    b: float = 0.75,
+) -> List[Tuple[int, float]]:
     query_terms = tokenize(query)
-    scores = {}
+    scores: Dict[int, float] = {}
 
-    avgdl = _loaded_inverted_index.avg_doc_len
-    doc_lens = _loaded_inverted_index.doc_len
+    # Local references for the hot loop.
+    idf_cache = _idf_cache
+    doc_norm = _doc_norm
+    get_postings = _loaded_inverted_index.get_postings
+    scores_get = scores.get
+
+    # Same for every posting.
+    k1_plus_one = k1 + 1
 
     for term in query_terms:
-        df = _loaded_inverted_index.document_frequency(term)
-        if df == 0:
+        if term not in idf_cache:
             continue
 
-        idf = get_idf(term)
-        postings = _loaded_inverted_index.get_postings(term)
+        idf = idf_cache[term]
+        postings = get_postings(term)
 
-        for doc_id, tf in postings.items():
-            doc_len = doc_lens[doc_id]
-            numerator = tf * (k1 + 1)
-            denominator = tf + k1 * (1 - b + b * (doc_len / avgdl))
+        for doc_int, tf in postings.items():
+            numerator = tf * k1_plus_one
 
-            term_score = idf * (numerator / denominator)
+            denominator = (
+                tf + k1 * doc_norm[doc_int]
+            )
 
-            if doc_id not in scores:
-                scores[doc_id] = 0.0
+            term_score = idf * (
+                numerator / denominator
+            )
 
-            scores[doc_id] += term_score
+            scores[doc_int] = (
+                scores_get(doc_int, 0.0)
+                + term_score
+            )
 
-    return heapq.nlargest(k, scores.items(), key=lambda x: x[1])
+    return heapq.nlargest(
+        k,
+        scores.items(),
+        key=itemgetter(1),
+    )
 
 
 def get_idf(term: str) -> float:
@@ -47,9 +98,10 @@ def get_idf(term: str) -> float:
     numerator = N - df + 0.5
     denominator = df + 0.5
 
-    return log(numerator / denominator + 1)
+    return log(
+        numerator / denominator + 1
+    )
+
 
 def get_df(term: str) -> int:
     return _loaded_inverted_index.document_frequency(term)
-
-    

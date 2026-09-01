@@ -97,9 +97,20 @@ def load_index(index_dir: str) -> None:
 
 def retrieve(query: str, k: int = 10) -> List[Tuple[str, float]]:
     """Return up to k (doc_id, score) pairs for `query`, best first."""
-    return bm25.score(query, k, k1=BM25_K1, b=BM25_B)
-    # return boolean_vsm.vsm_score(query, k)
 
+    results = bm25.score(
+        query,
+        k,
+        k1=BM25_K1,
+        b=BM25_B,
+    )
+
+    index = bm25.get_index()
+
+    return [
+        (index.int_to_doc[doc_int], score)
+        for doc_int, score in results
+    ]
 
 # ---------------------------------------------------------------------------
 # Trivial reference baseline — DO NOT submit this as your final entry.
