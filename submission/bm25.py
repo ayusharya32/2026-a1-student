@@ -29,6 +29,7 @@ parameters, not hard-coded — you need to sweep them for your report
 """
 from math import log
 from typing import List, Tuple
+import heapq
 from submission.indexer import InvertedIndex, tokenize
 
 _loaded_inverted_index = None
@@ -77,9 +78,7 @@ def score(query: str, k: int, k1: float = 1.2, b: float = 0.75) -> List[Tuple[st
                 scores[doc_id] = 0.0
 
             scores[doc_id] += term_score
-
-    rankedList = sorted(scores.items(), key= lambda x: x[1], reverse=True)
-    return rankedList[:k]
+    return heapq.nlargest(k, scores.items(), key= lambda x: x[1])
 
 
 
