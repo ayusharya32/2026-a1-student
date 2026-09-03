@@ -123,43 +123,37 @@ class InvertedIndex:
         current_doc = 0
 
         for _ in range(count):
-            # Read gap.
+            # Read packed gap and TF flag bit.
             val = 0
             shift = 0
 
             while pos < buf_len:
                 b = raw_bytes[pos]
                 pos += 1
-
                 val |= (b & 127) << shift
-
                 if not (b & 128):
                     break
-
                 shift += 7
 
-            gap = val
+            gap = val >> 1
+            has_extra_tf = val & 1
 
-            # Read term frequency.
-            val = 0
-            shift = 0
-
-            while pos < buf_len:
-                b = raw_bytes[pos]
-                pos += 1
-
-                val |= (b & 127) << shift
-
-                if not (b & 128):
-                    break
-
-                shift += 7
-
-            tf = val
+            if has_extra_tf:
+                # Read additional TF - 2
+                val = 0
+                shift = 0
+                while pos < buf_len:
+                    b = raw_bytes[pos]
+                    pos += 1
+                    val |= (b & 127) << shift
+                    if not (b & 128):
+                        break
+                    shift += 7
+                tf = val + 2
+            else:
+                tf = 1
 
             current_doc += gap
-
-            # Keep integer document ID during query-time scoring.
             postings[current_doc] = tf
 
         self._postings_cache[term] = postings
@@ -219,11 +213,17 @@ class InvertedIndex:
                 for doc_int, tf in entries:
                     gap = doc_int - previous_doc
 
-                    encode_var_int(buffer, gap)
-                    encode_var_int(buffer, tf)
+                    if tf == 1:
+                        # Pack gap with flag bit 0 (meaning tf == 1)
+                        encode_var_int(buffer, gap << 1)
+                    else:
+                        # Pack gap with flag bit 1 (meaning tf > 1) and store tf - 2
+                        encode_var_int(buffer, (gap << 1) | 1)
+                        encode_var_int(buffer, tf - 2)
 
                     previous_doc = doc_int
 
+                # --- THESE WERE THE MISSING LINES ---
                 postings_file.write(buffer)
 
                 end = postings_file.tell()
@@ -236,6 +236,7 @@ class InvertedIndex:
                         len(entries),
                     )
                 )
+                # ------------------------------------
 
         # vocabulary.bin
         vocab_buf = bytearray()

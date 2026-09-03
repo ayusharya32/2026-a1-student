@@ -64,8 +64,8 @@ _DOC_ORDER: Optional[List[str]] = None  # [doc_id, ...] in the order build_index
 
 _DOC_ORDER_FILENAME = "doc_order.json"  # TODO(you): replace with your real index files
 
-BM25_K1 = float(os.getenv("BM25_K1", "2.45"))
-BM25_B = float(os.getenv("BM25_B", "0.6"))
+BM25_K1 = float(os.getenv("BM25_K1", "1.8"))
+BM25_B = float(os.getenv("BM25_B", "0.55"))
 
 def build_index(corpus_path: str, index_dir: str) -> None:
     """Load the corpus, build whatever index structures you need, and
@@ -98,19 +98,13 @@ def load_index(index_dir: str) -> None:
 def retrieve(query: str, k: int = 10) -> List[Tuple[str, float]]:
     """Return up to k (doc_id, score) pairs for `query`, best first."""
 
-    results = bm25.score(
-        query,
-        k,
-        k1=BM25_K1,
-        b=BM25_B,
-    )
-
+    results = custom_scorer.score(query, k)
     index = bm25.get_index()
 
     return [
-        (index.int_to_doc[doc_int], score)
-        for doc_int, score in results
-    ]
+        (index.int_to_doc[doc_int] if isinstance(doc_int, int) else doc_int, score)
+         for doc_int, score in results
+     ]
 
 # ---------------------------------------------------------------------------
 # Trivial reference baseline — DO NOT submit this as your final entry.

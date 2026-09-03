@@ -8,13 +8,15 @@ from submission.indexer import InvertedIndex, tokenize
 
 _loaded_inverted_index = None
 _idf_cache: Dict[str, float] = {}
-_doc_norm: List[float] = []
+_doc_len_ratio: List[float] = []
+_doc_norm_cache: Dict[float, List[float]] = {}
 
 
 def build(index: InvertedIndex) -> None:
     global _loaded_inverted_index
     global _idf_cache
-    global _doc_norm
+    global _doc_len_ratio
+    global _doc_norm_cache
 
     _loaded_inverted_index = index
 
@@ -28,15 +30,14 @@ def build(index: InvertedIndex) -> None:
             (index.N - df + 0.5) / (df + 0.5) + 1
         )
 
-    # Precompute the document-length normalization part
-    # of the BM25 denominator.
-    avgdl = index.avg_doc_len
-    b = 0.6
+    # Precompute doc length ratios for fast document normalization calculation
+    avgdl = index.avg_doc_len if index.avg_doc_len > 0 else 1.0
 
-    _doc_norm = [
-        1 - b + b * doc_len / avgdl
-        for doc_len in index.doc_len_by_int
-    ]
+    _doc_len_ratio = [
+        doc_len / avgdl
+         for doc_len in index.doc_len_by_int
+     ]
+    _doc_norm_cache = {}
 
 
 def get_index() -> InvertedIndex:
@@ -54,7 +55,7 @@ def score(
 
     # Local references for the hot loop.
     idf_cache = _idf_cache
-    doc_norm = _doc_norm
+    doc_norm = _get_doc_norm(b)
     get_postings = _loaded_inverted_index.get_postings
     scores_get = scores.get
 
@@ -105,3 +106,12 @@ def get_idf(term: str) -> float:
 
 def get_df(term: str) -> int:
     return _loaded_inverted_index.document_frequency(term)
+
+def _get_doc_norm(b: float) -> List[float]:
+    if b not in _doc_norm_cache:
+        one_minus_b = 1.0 - b
+        _doc_norm_cache[b] = [
+            one_minus_b + b * ratio
+            for ratio in _doc_len_ratio
+        ]
+    return _doc_norm_cache[b]
